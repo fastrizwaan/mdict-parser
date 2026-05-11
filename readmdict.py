@@ -86,6 +86,113 @@ def _decrypt_regcode_by_email(reg_code, email):
     return encrypt_key
 
 
+def _zlib_decompress_best_effort(data, expected_size=None):
+    """
+    MDict type 0x02 is zlib (RFC1950: CMF+FLG + deflate + Adler-32).
+
+    Some MDX builders break strict zlib (bad Adler-32); try raw deflate and
+    other wbits. When *expected_size* is set (record blocks), only a result
+    with exactly that length is accepted — otherwise decompressobj() can
+    consume extra deflate past the logical block and break offsets.
+    """
+    last_err = None
+    wrong_lengths = []
+
+    def _run_strategies(strategies):
+        nonlocal last_err
+        for fn in strategies:
+            try:
+                out = fn()
+            except zlib.error as e:
+                last_err = e
+                continue
+            if expected_size is None:
+                return out
+            if len(out) == expected_size:
+                return out
+            wrong_lengths.append(len(out))
+        return None
+
+    # Prefer strip-wrapper before decompressobj: obj can inflate past the
+    # MDict-declared size when the bitstream is odd; raw deflate often matches.
+    strategies = [lambda: zlib.decompress(data)]
+    if len(data) >= 11 and data[0] == 0x78:
+        strategies.append(lambda: zlib.decompress(data[2:-4], wbits=-15))
+    strategies.extend(
+        [
+            lambda: zlib.decompress(data, wbits=-15),
+            lambda: zlib.decompress(data, wbits=47),
+        ]
+    )
+
+    def _via_obj(wbits):
+        d = zlib.decompressobj(wbits)
+        return d.decompress(data) + d.flush()
+
+    for wbits in (zlib.MAX_WBITS, zlib.MAX_WBITS | 32):
+        strategies.append(lambda w=wbits: _via_obj(w))
+
+    # Last resort: MDict index length wins — cap output (some streams over-expand).
+    if expected_size is not None:
+
+        def _inflate_capped():
+            d = zlib.decompressobj(zlib.MAX_WBITS)
+            out = d.decompress(data, max_length=expected_size)
+            while len(out) < expected_size:
+                chunk = d.decompress(b"", max_length=expected_size - len(out))
+                if not chunk:
+                    break
+                out += chunk
+            if len(out) != expected_size:
+                raise zlib.error(
+                    "capped inflate: got %d want %d" % (len(out), expected_size)
+                )
+            return out
+
+        strategies.append(_inflate_capped)
+
+    out = _run_strategies(strategies)
+    if out is not None:
+        return out
+
+    if expected_size is not None:
+        bits = [f"expected_len={expected_size}"]
+        if wrong_lengths:
+            bits.append("got_lens=%r" % sorted(set(wrong_lengths)))
+        if last_err is not None:
+            bits.append("last_error=%s" % last_err)
+        raise zlib.error("; ".join(bits))
+    if last_err is not None:
+        raise last_err
+    raise zlib.error("empty or invalid zlib data")
+
+
+def _maybe_better_title(header):
+    """
+    Some dictionaries ship with a placeholder Title like 'Title (No HTML code allowed)'.
+    Prefer the first meaningful line from Description in that case (for display only).
+    """
+    try:
+        title = header.get(b'Title', b'')
+        if title and title.strip().lower() != b'title (no html code allowed)':
+            return title
+        desc = header.get(b'Description', b'') or b''
+        # strip <pre> wrapper commonly used in Description
+        desc = re.sub(br'</?pre[^>]*>', b'', desc, flags=re.I).strip()
+        # take first non-empty line
+        for line in re.split(br'[\r\n]+', desc):
+            line = line.strip()
+            if line:
+                return line
+        return title
+    except Exception:
+        return header.get(b'Title', b'')
+
+
+def _hex_prefix(b, n=16):
+    return b[:n].hex()
+
+
 class MDict(object):
     """
     Base class which reads in header and key block.
@@ -122,7 +229,7 @@ class MDict(object):
         """
         extract attributes from <Dict attr="value" ... >
         """
-        taglist = re.findall(b'(\w+)="(.*?)"', header, re.DOTALL)
+        taglist = re.findall(rb'(\w+)="(.*?)"', header, re.DOTALL)
         tagdict = {}
         for key, value in taglist:
             tagdict[key] = _unescape_entities(value)
@@ -425,49 +532,95 @@ class MDD(MDict):
         f = open(self._fname, 'rb')
         f.seek(self._record_block_offset)
 
-        num_record_blocks = self._read_number(f)
-        num_entries = self._read_number(f)
-        assert(num_entries == self._num_entries)
-        record_block_info_size = self._read_number(f)
-        record_block_size = self._read_number(f)
+        def _read_record_index(width_bytes):
+            num_fmt = '>Q' if width_bytes == 8 else '>I'
+            def readn():
+                return unpack(num_fmt, f.read(width_bytes))[0]
 
-        # record block info section
-        record_block_info_list = []
-        size_counter = 0
-        for i in range(num_record_blocks):
-            compressed_size = self._read_number(f)
-            decompressed_size = self._read_number(f)
-            record_block_info_list += [(compressed_size, decompressed_size)]
-            size_counter += self._number_width * 2
+            num_record_blocks = readn()
+            num_entries = readn()
+            record_block_info_size = readn()
+            record_block_size = readn()
+
+            record_block_info_list = []
+            size_counter = 0
+            for _ in range(num_record_blocks):
+                compressed_size = readn()
+                decompressed_size = readn()
+                record_block_info_list.append((compressed_size, decompressed_size))
+                size_counter += width_bytes * 2
+            return (num_record_blocks, num_entries, record_block_info_size, record_block_size, size_counter, record_block_info_list)
+
+        index_start = f.tell()
+        # normal v2 record index uses 8-byte integers, but some files are non-standard.
+        num_record_blocks, num_entries, record_block_info_size, record_block_size, size_counter, record_block_info_list = _read_record_index(self._number_width)
+        assert(num_entries == self._num_entries)
         assert(size_counter == record_block_info_size)
+
+        # validate by peeking at the first record block's type
+        first_block_pos = f.tell()
+        if record_block_info_list:
+            first_comp_size, _ = record_block_info_list[0]
+            peek = f.read(min(first_comp_size, 16))
+            f.seek(first_block_pos)
+            if peek[:4] not in (b'\x00\x00\x00\x00', b'\x01\x00\x00\x00', b'\x02\x00\x00\x00') and self._number_width == 8:
+                # Rewind and retry with 4-byte integers.
+                f.seek(index_start)
+                num_record_blocks, num_entries, record_block_info_size, record_block_size, size_counter, record_block_info_list = _read_record_index(4)
+                assert(num_entries == self._num_entries)
+                assert(size_counter == record_block_info_size)
 
         # actual record block
         offset = 0
         i = 0
         size_counter = 0
-        for compressed_size, decompressed_size in record_block_info_list:
+        for block_idx, (compressed_size, decompressed_size) in enumerate(record_block_info_list):
+            block_pos = f.tell()
             record_block_compressed = f.read(compressed_size)
-            # 4 bytes: compression type
-            record_block_type = record_block_compressed[:4]
-            # 4 bytes: adler32 checksum of decompressed record block
-            adler32 = unpack('>I', record_block_compressed[4:8])[0]
-            if record_block_type == b'\x00\x00\x00\x00':
-                record_block = record_block_compressed[8:]
-            elif record_block_type == b'\x01\x00\x00\x00':
-                if lzo is None:
-                    print("LZO compression is not supported")
+
+            # Record blocks use mdx_decrypt only when Encrypted bit0 is set (keyword-header
+            # encryption in spec; some files also use it for record payloads).
+            if self._encrypt & 0x01:
+                block_candidates = [_mdx_decrypt(record_block_compressed)]
+            else:
+                block_candidates = [record_block_compressed]
+            record_block = None
+            for cand in block_candidates:
+                record_block_type = cand[:4]
+                if record_block_type == b'\x00\x00\x00\x00':
+                    record_block = cand[8:]
                     break
-                # decompress
-                header = b'\xf0' + pack('>I', decompressed_size)
-                record_block = lzo.decompress(header + record_block_compressed[8:])
-            elif record_block_type == b'\x02\x00\x00\x00':
-                # decompress
-                record_block = zlib.decompress(record_block_compressed[8:])
+                if record_block_type == b'\x01\x00\x00\x00':
+                    if lzo is None:
+                        continue
+                    header = b'\xf0' + pack('>I', decompressed_size)
+                    record_block = lzo.decompress(header + cand[8:])
+                    break
+                if record_block_type == b'\x02\x00\x00\x00':
+                    try:
+                        record_block = _zlib_decompress_best_effort(
+                            cand[8:], decompressed_size
+                        )
+                        break
+                    except zlib.error:
+                        record_block = None
 
-            # notice that adler32 return signed value
-            assert(adler32 == zlib.adler32(record_block) & 0xffffffff)
+            if record_block is None:
+                raise RuntimeError(
+                    "Unable to decode record block (unknown/encrypted/compressed format). "
+                    f"block_idx={block_idx} file_pos={block_pos} "
+                    f"comp_size={compressed_size} decomp_size={decompressed_size} "
+                    f"prefix={_hex_prefix(record_block_compressed)}"
+                )
 
-            assert(len(record_block) == decompressed_size)
+            # Declared size is authoritative; some MDX builds store a wrong block Adler-32.
+            if len(record_block) != decompressed_size:
+                raise RuntimeError(
+                    "Record block decompressed length mismatch. "
+                    f"block_idx={block_idx} got={len(record_block)} expected={decompressed_size} "
+                    f"file_pos={block_pos}"
+                )
+
             # split record block according to the offset info from key block
             while i < len(self._key_list):
                 record_start, key_text = self._key_list[i]
@@ -509,8 +662,8 @@ class MDX(MDict):
 
     def _substitute_stylesheet(self, txt):
         # substitute stylesheet definition
-        txt_list = re.split('`\d+`', txt)
-        txt_tag = re.findall('`\d+`', txt)
+        txt_list = re.split(br'`\d+`', txt)
+        txt_tag = re.findall(br'`\d+`', txt)
         txt_styled = txt_list[0]
         for j, p in enumerate(txt_list[1:]):
             style = self._stylesheet[txt_tag[j][1:-1]]
@@ -524,52 +677,94 @@ class MDX(MDict):
         f = open(self._fname, 'rb')
         f.seek(self._record_block_offset)
 
-        num_record_blocks = self._read_number(f)
-        num_entries = self._read_number(f)
-        assert(num_entries == self._num_entries)
-        record_block_info_size = self._read_number(f)
-        record_block_size = self._read_number(f)
+        def _read_record_index(width_bytes):
+            num_fmt = '>Q' if width_bytes == 8 else '>I'
+            def readn():
+                return unpack(num_fmt, f.read(width_bytes))[0]
 
-        # record block info section
-        record_block_info_list = []
-        size_counter = 0
-        for i in range(num_record_blocks):
-            compressed_size = self._read_number(f)
-            decompressed_size = self._read_number(f)
-            record_block_info_list += [(compressed_size, decompressed_size)]
-            size_counter += self._number_width * 2
+            num_record_blocks = readn()
+            num_entries = readn()
+            record_block_info_size = readn()
+            record_block_size = readn()
+
+            record_block_info_list = []
+            size_counter = 0
+            for _ in range(num_record_blocks):
+                compressed_size = readn()
+                decompressed_size = readn()
+                record_block_info_list.append((compressed_size, decompressed_size))
+                size_counter += width_bytes * 2
+            return (num_record_blocks, num_entries, record_block_info_size, record_block_size, size_counter, record_block_info_list)
+
+        index_start = f.tell()
+        num_record_blocks, num_entries, record_block_info_size, record_block_size, size_counter, record_block_info_list = _read_record_index(self._number_width)
+        assert(num_entries == self._num_entries)
         assert(size_counter == record_block_info_size)
+
+        # validate by peeking at the first record block's type
+        first_block_pos = f.tell()
+        if record_block_info_list:
+            first_comp_size, _ = record_block_info_list[0]
+            peek = f.read(min(first_comp_size, 16))
+            f.seek(first_block_pos)
+            if peek[:4] not in (b'\x00\x00\x00\x00', b'\x01\x00\x00\x00', b'\x02\x00\x00\x00') and self._number_width == 8:
+                f.seek(index_start)
+                num_record_blocks, num_entries, record_block_info_size, record_block_size, size_counter, record_block_info_list = _read_record_index(4)
+                assert(num_entries == self._num_entries)
+                assert(size_counter == record_block_info_size)
 
         # actual record block data
         offset = 0
         i = 0
         size_counter = 0
-        for compressed_size, decompressed_size in record_block_info_list:
+        for block_idx, (compressed_size, decompressed_size) in enumerate(record_block_info_list):
+            block_pos = f.tell()
             record_block_compressed = f.read(compressed_size)
-            # 4 bytes indicates block compression type
-            record_block_type = record_block_compressed[:4]
-            # 4 bytes adler checksum of uncompressed content
-            adler32 = unpack('>I', record_block_compressed[4:8])[0]
-            # no compression
-            if record_block_type == b'\x00\x00\x00\x00':
-                record_block = record_block_compressed[8:]
-            # lzo compression
-            elif record_block_type == b'\x01\x00\x00\x00':
-                if lzo is None:
-                    print("LZO compression is not supported")
+
+            if self._encrypt & 0x01:
+                block_candidates = [_mdx_decrypt(record_block_compressed)]
+            else:
+                block_candidates = [record_block_compressed]
+
+            record_block = None
+            for cand in block_candidates:
+                record_block_type = cand[:4]
+
+                if record_block_type == b'\x00\x00\x00\x00':
+                    record_block = cand[8:]
                     break
-                # decompress
-                header = b'\xf0' + pack('>I', decompressed_size)
-                record_block = lzo.decompress(header + record_block_compressed[8:])
-            # zlib compression
-            elif record_block_type == b'\x02\x00\x00\x00':
-                # decompress
-                record_block = zlib.decompress(record_block_compressed[8:])
 
-            # notice that adler32 return signed value
-            assert(adler32 == zlib.adler32(record_block) & 0xffffffff)
+                if record_block_type == b'\x01\x00\x00\x00':
+                    if lzo is None:
+                        continue
+                    header = b'\xf0' + pack('>I', decompressed_size)
+                    record_block = lzo.decompress(header + cand[8:])
+                    break
 
-            assert(len(record_block) == decompressed_size)
+                if record_block_type == b'\x02\x00\x00\x00':
+                    try:
+                        record_block = _zlib_decompress_best_effort(
+                            cand[8:], decompressed_size
+                        )
+                        break
+                    except zlib.error:
+                        record_block = None
+
+            if record_block is None:
+                raise RuntimeError(
+                    "Unable to decode record block (unknown/encrypted/compressed format). "
+                    f"block_idx={block_idx} file_pos={block_pos} "
+                    f"comp_size={compressed_size} decomp_size={decompressed_size} "
+                    f"prefix={_hex_prefix(record_block_compressed)}"
+                )
+
+            if len(record_block) != decompressed_size:
+                raise RuntimeError(
+                    "Record block decompressed length mismatch. "
+                    f"block_idx={block_idx} got={len(record_block)} expected={decompressed_size} "
+                    f"file_pos={block_pos}"
+                )
+
             # split record block according to the offset info from key block
             while i < len(self._key_list):
                 record_start, key_text = self._key_list[i]
@@ -652,6 +847,10 @@ if __name__ == '__main__':
             bfname = args.filename
         print('======== %s ========' % bfname)
         print('  Number of Entries : %d' % len(mdx))
+        # display a better title if the file uses placeholder metadata
+        better_title = _maybe_better_title(mdx.header)
+        if better_title and mdx.header.get(b'Title') != better_title:
+            print('  DisplayTitle : %s' % better_title)
         for key, value in mdx.header.items():
             print('  %s : %s' % (key, value))
     else:
