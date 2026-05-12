@@ -172,7 +172,6 @@ class HTML2XDXFParser(HTMLParser):
             if href.lower().startswith('sound://'):
                 fname = href[len('sound://'):]
                 self._emit(f'<rref lctn="{xml_escape(fname)}"/>')
-                xdxf_tags.append('__skip__')
             elif href.lower().startswith('entry://'):
                 word = href[len('entry://'):]
                 try:
@@ -181,7 +180,6 @@ class HTML2XDXFParser(HTMLParser):
                 except Exception:
                     pass
                 self._emit(f'<kref>{xml_escape(word)}</kref>')
-                xdxf_tags.append('__skip__')
             
             self._tag_stack.append((tag_lower, xdxf_tags))
             return

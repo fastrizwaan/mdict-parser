@@ -106,6 +106,16 @@ class HTML2DSLParser(HTMLParser):
             return False
         return bool(re.search(r'display\s*:\s*block', style, re.IGNORECASE))
 
+    def _get_margin_level(self, style):
+        """Extract margin level from margin-left style."""
+        if not style:
+            return 0
+        m = re.search(r'margin-left\s*:\s*(\d+)px', style, re.IGNORECASE)
+        if m:
+            px = int(m.group(1))
+            return max(1, px // 20)
+        return 0
+
     # -- HTMLParser callbacks --
     def handle_starttag(self, tag, attrs):
         tag_lower = tag.lower()
@@ -166,7 +176,7 @@ class HTML2DSLParser(HTMLParser):
             if href.lower().startswith('sound://'):
                 fname = href[len('sound://'):]
                 self._emit(f'[s]{dsl_escape(fname)}[/s]')
-                self._tag_stack.append('__skip__')
+                self._tag_stack.append(None)
                 return
             elif href.lower().startswith('http://') or href.lower().startswith('https://'):
                 self._emit('[url]')
@@ -198,6 +208,13 @@ class HTML2DSLParser(HTMLParser):
 
         # <span> — display:block check
         if tag_lower == 'span':
+            margin_delta = self._get_margin_level(style)
+            if margin_delta > 0:
+                self._margin += margin_delta
+                self._emit_break()
+                self._tag_stack.append(('margin', margin_delta))
+                return
+            
             if self._is_block_display(style):
                 self._emit_break()
             self._tag_stack.append(None)
@@ -258,6 +275,9 @@ class HTML2DSLParser(HTMLParser):
                     self._emit_break()
                 elif dsl_tag == 'sds_list':
                     self._margin = max(0, self._margin - 1)
+                    self._emit_break()
+                elif isinstance(dsl_tag, tuple) and dsl_tag[0] == 'margin':
+                    self._margin = max(0, self._margin - dsl_tag[1])
                     self._emit_break()
                 elif dsl_tag == '__skip__':
                     pass
