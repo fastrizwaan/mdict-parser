@@ -169,21 +169,32 @@ def _zlib_decompress_best_effort(data, expected_size=None):
 
 def _maybe_better_title(header):
     """
-    Some dictionaries ship with a placeholder Title like 'Title (No HTML code allowed)'.
-    Prefer the first meaningful line from Description in that case (for display only).
+    Some dictionaries ship with a placeholder Title like 'Title (No HTML code allowed)'
+    or a date-like string like '2014.03.05'.
+    Prefer the first meaningful line from Description in those cases.
     """
     try:
         title = header.get(b'Title', b'')
-        if title and title.strip().lower() != b'title (no html code allowed)':
-            return title
+        if title:
+            # Check for common placeholders
+            t_str = title.strip().decode('utf-8', errors='replace').lower()
+            is_placeholder = (
+                t_str == 'title (no html code allowed)' or 
+                re.match(r'^\d{4}[\.\-]\d{2}[\.\-]\d{2}', t_str)
+            )
+            if not is_placeholder:
+                return title
+
         desc = header.get(b'Description', b'') or b''
         # strip <pre> wrapper commonly used in Description
         desc = re.sub(br'</?pre[^>]*>', b'', desc, flags=re.I).strip()
         # take first non-empty line
         for line in re.split(br'[\r\n]+', desc):
             line = line.strip()
-            if line:
-                return line
+            # strip HTML tags from the line to get a clean title
+            line_clean = re.sub(br'<[^>]+>', b'', line).strip()
+            if line_clean:
+                return line_clean
         return title
     except Exception:
         return header.get(b'Title', b'')
