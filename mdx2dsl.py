@@ -175,12 +175,25 @@ class HTML2DSLParser(HTMLParser):
             href = attrs_dict.get('href', '')
             if href.lower().startswith('sound://'):
                 fname = href[len('sound://'):]
-                self._emit(f'[s]{dsl_escape(fname)}[/s]')
-                self._tag_stack.append(None)
+                # In DSL, we wrap the content in a ref to the sound:// URI.
+                # This makes the content (like an icon) clickable to play sound
+                # without showing an extra play button icon.
+                self._emit(f'[ref "sound://{dsl_escape(fname)}"]')
+                self._tag_stack.append('ref')
                 return
             elif href.lower().startswith('http://') or href.lower().startswith('https://'):
                 self._emit('[url]')
                 self._tag_stack.append('url')
+                return
+            elif href.lower().startswith('entry://'):
+                word = href[len('entry://'):]
+                try:
+                    from urllib.parse import unquote
+                    word = unquote(word)
+                except Exception:
+                    pass
+                self._emit(f'[ref "{dsl_escape(word)}"]')
+                self._tag_stack.append('ref')
                 return
             elif href:
                 self._emit('[ref]')
